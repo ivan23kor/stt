@@ -3,6 +3,7 @@ import io
 import logging
 import os
 import subprocess
+import tempfile
 import threading
 import wave
 
@@ -13,11 +14,23 @@ from pynput import keyboard
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 TRANSCRIPTION_PROMPT = os.environ.get(
     "STT_TRANSCRIPTION_PROMPT",
     "Dictation for general desktop text entry.",
+)
+SUMMARY_MODEL = os.environ.get("STT_SUMMARY_MODEL", "openai/gpt-oss-20b")
+SUMMARY_PROMPT = os.environ.get(
+    "STT_SUMMARY_PROMPT",
+    "You summarize text to be read aloud. Reply with a short spoken-friendly gist "
+    "(2-4 sentences), plain prose only — no markdown, lists, or headings.",
+)
+PIPER_BIN = os.path.expanduser("~/.local/bin/piper")
+PIPER_MODEL = os.environ.get(
+    "STT_PIPER_MODEL",
+    os.path.expanduser("~/.local/share/piper/en_US-amy-medium.onnx"),
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -88,6 +101,125 @@ def _type_text(text):
         )
 
 
+# ── TTS / speak-selection ─────────────────────────────────────────────────────
+
+def _get_selection():
+    """Return the current X primary selection, falling back to clipboard."""
+    for sel in ("primary", "clipboard"):
+        result = subprocess.run(
+            ["xclip", "-o", "-selection", sel],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return ""
+
+
+def _summarize(text):
+    """Send text to Groq and return a short spoken-friendly gist."""
+    with httpx.Client(timeout=httpx.Timeout(5.0, read=30.0)) as client:
+        resp = client.post(
+            GROQ_CHAT_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": SUMMARY_MODEL,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": SUMMARY_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+def _speak(text):
+    """Synthesize text with local Piper TTS and play via mpv."""
+    # Kill any in-progress TTS playback first.
+    subprocess.run(["pkill", "-f", "mpv.*tts-audio"], capture_output=True)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, prefix="tts-") as f:
+        tmp_path = f.name
+
+    try:
+        piper = subprocess.Popen(
+            [PIPER_BIN, "--model", PIPER_MODEL, "--output_raw"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        ffmpeg = subprocess.Popen(
+            [
+                "ffmpeg", "-f", "s16le", "-ar", "22050", "-ac", "1",
+                "-i", "-", "-y", tmp_path,
+            ],
+            stdin=piper.stdout,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        piper.stdin.write(text.encode())
+        piper.stdin.close()
+        piper.wait()
+        ffmpeg.wait()
+
+        proc = subprocess.Popen(
+            ["mpv", "--no-video", "--no-osd-bar", "--title=tts-audio", tmp_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.wait()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _stop_speech():
+    subprocess.run(["pkill", "-f", "mpv.*tts-audio"], capture_output=True)
+
+
+def _toggle_pause():
+    result = subprocess.run(
+        ["playerctl", "--list-all"], capture_output=True, text=True
+    )
+    instance = next(
+        (line for line in result.stdout.splitlines() if "mpv" in line), None
+    )
+    if instance:
+        subprocess.run(
+            ["playerctl", f"--player={instance}", "play-pause"], check=False
+        )
+    else:
+        log.info("No TTS playback running")
+
+
+def _speak_selection():
+    """Grab selection, summarize with Groq, speak with Piper."""
+    text = _get_selection()
+    if not text:
+        subprocess.run(
+            ["notify-send", "-u", "normal", "-i", "audio-volume-high",
+             "Speak", "No text selected"],
+            check=False,
+        )
+        return
+    log.info("Summarizing %d chars...", len(text))
+    try:
+        gist = _summarize(text)
+        log.info("→ gist: %r", gist)
+        _speak(gist)
+    except Exception as exc:
+        log.error("Speak-selection failed: %s", exc)
+        subprocess.run(
+            ["notify-send", "-u", "critical", "-i", "dialog-error",
+             "Speak failed", str(exc)],
+            check=False,
+        )
+
+
 def _on_release(session):
     captured = session.stop_and_capture()
     duration_s = len(captured) * 1024 / SAMPLE_RATE  # approx
@@ -115,7 +247,7 @@ def _on_release(session):
 
 
 def main():
-    log.info("STT daemon ready — hold Ctrl+Space to dictate")
+    log.info("STT daemon ready — hold Ctrl+Space to dictate, Ctrl+Alt+S to speak selection")
 
     ctrl_held = False
     space_held = False
@@ -178,6 +310,19 @@ def main():
             space_held = False
         if not (ctrl_held and space_held):
             _schedule_stop()
+
+    hotkeys = keyboard.GlobalHotKeys({
+        "<ctrl>+<alt>+s": lambda: threading.Thread(
+            target=_speak_selection, daemon=True
+        ).start(),
+        "<ctrl>+<alt>+x": lambda: threading.Thread(
+            target=_stop_speech, daemon=True
+        ).start(),
+        "<ctrl>+<alt>+p": lambda: threading.Thread(
+            target=_toggle_pause, daemon=True
+        ).start(),
+    })
+    hotkeys.start()
 
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         listener.join()
