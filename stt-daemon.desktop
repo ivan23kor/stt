@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=STT Dictation
+Comment=Hold Ctrl+Space to dictate into the focused window
+Exec=bash -c 'cd /opt/stt && DISPLAY=:0 /opt/stt/.venv/bin/python main.py >> /tmp/stt-daemon.log 2>&1'
+Terminal=false
+X-GNOME-Autostart-enabled=true

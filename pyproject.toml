@@ -1,0 +1,12 @@
+[project]
+name = "stt"
+version = "0.1.0"
+description = "Ctrl+Space desktop speech-to-text dictation daemon"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "numpy>=2.4.4",
+    "pynput>=1.8.1",
+    "sounddevice>=0.5.5",
+]
