@@ -31,3 +31,18 @@ transcription starts.
 
 Copy `stt-daemon.desktop` to `~/.config/autostart/stt-daemon.desktop` and make
 sure `GROQ_API_KEY` is available in the desktop session environment.
+
+## Commit Safety
+
+This repo includes local Git hooks that run syntax, secret, Semgrep, and
+dependency checks before commit and push:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Run the same checks manually:
+
+```bash
+scripts/security-check.sh
+```
