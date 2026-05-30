@@ -32,6 +32,7 @@ SUMMARY_PROMPT = os.environ.get(
 PROGRESS_ENABLED = os.environ.get("STT_PROGRESS", "1") != "0"
 PROGRESS_TICK_S  = 0.2   # redraw cadence (seconds)
 PROGRESS_CAP     = 0.95  # never claim 100% until the result actually arrives
+ETA_OPTIMISM     = 0.8   # bias estimate low so dots fill early and wait at full
 ETA_BASE         = float(os.environ.get("STT_ETA_BASE", "0.6"))    # network/queue floor (s)
 ETA_PER_SEC      = float(os.environ.get("STT_ETA_PER_SEC", "0.3")) # decode seconds per audio second
 CAL_PATH         = os.path.expanduser("~/.cache/stt/latency-cal.json")
@@ -233,14 +234,14 @@ def _speak_selection():
         )
 
 
-def _render_pct(frac):
-    """Return a short ASCII percentage, e.g. '36%'.
+def _render_dots(frac):
+    """Return 1–5 dots, one per 20% (1 dot at 0%, 5 dots at >=80%).
 
     Kept tiny on purpose: each in-place update erases len(shown) chars via
-    synthetic BackSpace keystrokes, so a 3-char string is ~5x cheaper than a
-    full-width bar and won't saturate X input.
+    synthetic BackSpace keystrokes, so 1–5 chars stays cheap and won't
+    saturate X input.
     """
-    return f"{int(max(0.0, min(1.0, frac)) * 100)}%"
+    return "." * min(5, 1 + int(max(0.0, min(1.0, frac)) / 0.2))
 
 
 def _load_cal():
@@ -254,7 +255,7 @@ def _load_cal():
 
 def _estimate_eta(duration_s):
     """Estimate transcription latency from audio duration (seconds)."""
-    return max(0.3, (ETA_BASE + ETA_PER_SEC * duration_s) * _load_cal())
+    return max(0.3, ETA_OPTIMISM * (ETA_BASE + ETA_PER_SEC * duration_s) * _load_cal())
 
 
 def _update_calibration(duration_s, latency):
@@ -317,7 +318,7 @@ class CaretProgress:
                 return
             elapsed = time.monotonic() - self._start
             frac = min(PROGRESS_CAP, elapsed / self._eta)
-            self._draw(_render_pct(frac))
+            self._draw(_render_dots(frac))
             self._timer = threading.Timer(PROGRESS_TICK_S, self._tick)
             self._timer.daemon = True
             self._timer.start()
