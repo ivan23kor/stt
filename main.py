@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import io
+import json
 import logging
 import os
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 
 import httpx
@@ -27,6 +29,16 @@ SUMMARY_PROMPT = os.environ.get(
     "You summarize text to be read aloud. Reply with a short spoken-friendly gist "
     "(2-4 sentences), plain prose only — no markdown, lists, or headings.",
 )
+PROGRESS_ENABLED = os.environ.get("STT_PROGRESS", "1") != "0"
+PROGRESS_CELLS   = int(os.environ.get("STT_PROGRESS_CELLS", "10"))
+PROGRESS_FILL    = os.environ.get("STT_PROGRESS_FILL", "▰")
+PROGRESS_EMPTY   = os.environ.get("STT_PROGRESS_EMPTY", "▱")
+PROGRESS_TICK_S  = 0.2   # redraw cadence (seconds)
+PROGRESS_CAP     = 0.95  # never claim 100% until the result actually arrives
+ETA_BASE         = float(os.environ.get("STT_ETA_BASE", "0.6"))    # network/queue floor (s)
+ETA_PER_SEC      = float(os.environ.get("STT_ETA_PER_SEC", "0.3")) # decode seconds per audio second
+CAL_PATH         = os.path.expanduser("~/.cache/stt/latency-cal.json")
+
 PIPER_BIN = os.path.expanduser("~/.local/bin/piper")
 PIPER_MODEL = os.environ.get(
     "STT_PIPER_MODEL",
@@ -224,6 +236,104 @@ def _speak_selection():
         )
 
 
+def _render_bar(frac):
+    """Return a fixed-width progress string, e.g. '▰▰▰▱▱▱▱▱▱▱  30%'."""
+    frac = max(0.0, min(1.0, frac))
+    filled = round(frac * PROGRESS_CELLS)
+    return (PROGRESS_FILL * filled
+            + PROGRESS_EMPTY * (PROGRESS_CELLS - filled)
+            + f" {int(frac * 100):>3d}%")  # always CELLS + 5 chars wide
+
+
+def _load_cal():
+    """Return the persisted ETA-calibration multiplier (default 1.0)."""
+    try:
+        with open(CAL_PATH) as f:
+            return float(json.load(f)["cal"])
+    except Exception:
+        return 1.0
+
+
+def _estimate_eta(duration_s):
+    """Estimate transcription latency from audio duration (seconds)."""
+    return max(0.3, (ETA_BASE + ETA_PER_SEC * duration_s) * _load_cal())
+
+
+def _update_calibration(duration_s, latency):
+    """Nudge the ETA multiplier toward reality via a clamped EMA."""
+    base = ETA_BASE + ETA_PER_SEC * duration_s
+    if base <= 0:
+        return
+    cal = max(0.3, min(3.0, 0.8 * _load_cal() + 0.2 * (latency / base)))
+    try:
+        os.makedirs(os.path.dirname(CAL_PATH), exist_ok=True)
+        with open(CAL_PATH, "w") as f:
+            json.dump({"cal": cal}, f)
+    except OSError:
+        pass
+
+
+class CaretProgress:
+    """Types a live progress bar at the cursor while waiting for transcription.
+
+    All xdotool calls are serialized under a lock so ticks and finish()
+    can never interleave. finish() erases the bar and leaves a clean caret
+    so that _type_text() can insert the real text immediately after.
+    """
+
+    def __init__(self, eta):
+        self._eta = eta
+        self._start = None
+        self._shown = ""      # currently rendered bar text (or "" if none yet)
+        self._done = False
+        self._lock = threading.Lock()
+        self._timer = None
+
+    def start(self):
+        self._start = time.monotonic()
+        self._timer = threading.Timer(PROGRESS_TICK_S, self._tick)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _draw(self, new):
+        """Erase the current bar and type the new one (noop if unchanged)."""
+        if new == self._shown:
+            return
+        if self._shown:
+            n = len(self._shown)
+            subprocess.run(
+                ["xdotool", "key", "--clearmodifiers",
+                 "--repeat", str(n), "BackSpace"],
+                check=False,
+            )
+        if new:
+            subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--delay", "0", new],
+                check=False,
+            )
+        self._shown = new
+
+    def _tick(self):
+        with self._lock:
+            if self._done:
+                return
+            elapsed = time.monotonic() - self._start
+            frac = min(PROGRESS_CAP, elapsed / self._eta)
+            self._draw(_render_bar(frac))
+            self._timer = threading.Timer(PROGRESS_TICK_S, self._tick)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def finish(self):
+        """Erase the bar completely, leaving the caret clean."""
+        with self._lock:
+            self._done = True
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            self._draw("")
+
+
 def _on_release(session):
     captured = session.stop_and_capture()
     duration_s = len(captured) * 1024 / SAMPLE_RATE  # approx
@@ -231,12 +341,22 @@ def _on_release(session):
         log.info("Too short (%.1fs), ignored", duration_s)
         return
     log.info("Transcribing %.1fs of audio...", duration_s)
+    bar = CaretProgress(_estimate_eta(duration_s)) if PROGRESS_ENABLED else None
+    if bar:
+        bar.start()
+    t0 = time.monotonic()
     try:
         wav = _frames_to_wav(captured)
         text = _transcribe(wav)
-        log.info("→ %r", text)
+        latency = time.monotonic() - t0
+        if bar:
+            bar.finish()  # erase bar before typing result
+        log.info("→ %r (%.1fs)", text, latency)
         _type_text(text)
+        _update_calibration(duration_s, latency)
     except Exception as exc:
+        if bar:
+            bar.finish()  # erase bar before showing failure notification
         log.error("Transcription failed: %s", exc)
         subprocess.run(
             [
