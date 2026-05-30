@@ -30,9 +30,6 @@ SUMMARY_PROMPT = os.environ.get(
     "(2-4 sentences), plain prose only — no markdown, lists, or headings.",
 )
 PROGRESS_ENABLED = os.environ.get("STT_PROGRESS", "1") != "0"
-PROGRESS_CELLS   = int(os.environ.get("STT_PROGRESS_CELLS", "10"))
-PROGRESS_FILL    = os.environ.get("STT_PROGRESS_FILL", "▰")
-PROGRESS_EMPTY   = os.environ.get("STT_PROGRESS_EMPTY", "▱")
 PROGRESS_TICK_S  = 0.2   # redraw cadence (seconds)
 PROGRESS_CAP     = 0.95  # never claim 100% until the result actually arrives
 ETA_BASE         = float(os.environ.get("STT_ETA_BASE", "0.6"))    # network/queue floor (s)
@@ -236,13 +233,14 @@ def _speak_selection():
         )
 
 
-def _render_bar(frac):
-    """Return a fixed-width progress string, e.g. '▰▰▰▱▱▱▱▱▱▱  30%'."""
-    frac = max(0.0, min(1.0, frac))
-    filled = round(frac * PROGRESS_CELLS)
-    return (PROGRESS_FILL * filled
-            + PROGRESS_EMPTY * (PROGRESS_CELLS - filled)
-            + f" {int(frac * 100):>3d}%")  # always CELLS + 5 chars wide
+def _render_pct(frac):
+    """Return a short ASCII percentage, e.g. '36%'.
+
+    Kept tiny on purpose: each in-place update erases len(shown) chars via
+    synthetic BackSpace keystrokes, so a 3-char string is ~5x cheaper than a
+    full-width bar and won't saturate X input.
+    """
+    return f"{int(max(0.0, min(1.0, frac)) * 100)}%"
 
 
 def _load_cal():
@@ -274,11 +272,11 @@ def _update_calibration(duration_s, latency):
 
 
 class CaretProgress:
-    """Types a live progress bar at the cursor while waiting for transcription.
+    """Types a live percentage at the cursor while waiting for transcription.
 
     All xdotool calls are serialized under a lock so ticks and finish()
-    can never interleave. finish() erases the bar and leaves a clean caret
-    so that _type_text() can insert the real text immediately after.
+    can never interleave. finish() erases the percentage and leaves a clean
+    caret so that _type_text() can insert the real text immediately after.
     """
 
     def __init__(self, eta):
@@ -296,7 +294,7 @@ class CaretProgress:
         self._timer.start()
 
     def _draw(self, new):
-        """Erase the current bar and type the new one (noop if unchanged)."""
+        """Erase the current text and type the new one (noop if unchanged)."""
         if new == self._shown:
             return
         if self._shown:
@@ -319,13 +317,13 @@ class CaretProgress:
                 return
             elapsed = time.monotonic() - self._start
             frac = min(PROGRESS_CAP, elapsed / self._eta)
-            self._draw(_render_bar(frac))
+            self._draw(_render_pct(frac))
             self._timer = threading.Timer(PROGRESS_TICK_S, self._tick)
             self._timer.daemon = True
             self._timer.start()
 
     def finish(self):
-        """Erase the bar completely, leaving the caret clean."""
+        """Erase the percentage completely, leaving the caret clean."""
         with self._lock:
             self._done = True
             if self._timer:
