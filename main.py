@@ -324,13 +324,35 @@ class CaretProgress:
             self._timer.start()
 
     def finish(self):
-        """Erase the percentage completely, leaving the caret clean."""
+        """Erase the dots completely, leaving the caret clean (failure path)."""
         with self._lock:
             self._done = True
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
             self._draw("")
+
+    def replace_with(self, text):
+        """Atomically swap the dots for the final text in one xdotool call.
+
+        Erasing and typing in a single invocation means the dots stay on
+        screen right up until the text appears — no empty gap where the
+        indicator has been removed but the result hasn't landed yet.
+        """
+        with self._lock:
+            self._done = True
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            cmd = ["xdotool"]
+            if self._shown:
+                cmd += ["key", "--clearmodifiers",
+                        "--repeat", str(len(self._shown)), "BackSpace"]
+            if text:
+                cmd += ["type", "--clearmodifiers", "--delay", "0", text]
+            self._shown = ""
+            if len(cmd) > 1:
+                subprocess.run(cmd, check=False)
 
 
 def _on_release(session):
@@ -349,9 +371,10 @@ def _on_release(session):
         text = _transcribe(wav)
         latency = time.monotonic() - t0
         if bar:
-            bar.finish()  # erase bar before typing result
+            bar.replace_with(text)  # dots stay until text lands, then atomic swap
+        else:
+            _type_text(text)
         log.info("→ %r (%.1fs)", text, latency)
-        _type_text(text)
         _update_calibration(duration_s, latency)
     except Exception as exc:
         if bar:
