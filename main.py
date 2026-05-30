@@ -77,7 +77,9 @@ def _frames_to_wav(frames):
 
 
 def _transcribe(wav_bytes):
-    with httpx.Client(timeout=httpx.Timeout(5.0, read=30.0)) as client:
+    with httpx.Client(
+        timeout=httpx.Timeout(connect=10.0, write=120.0, read=60.0, pool=5.0)
+    ) as client:
         resp = client.post(
             GROQ_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
@@ -118,7 +120,9 @@ def _get_selection():
 
 def _summarize(text):
     """Send text to Groq and return a short spoken-friendly gist."""
-    with httpx.Client(timeout=httpx.Timeout(5.0, read=30.0)) as client:
+    with httpx.Client(
+        timeout=httpx.Timeout(connect=10.0, write=120.0, read=60.0, pool=5.0)
+    ) as client:
         resp = client.post(
             GROQ_CHAT_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
@@ -240,7 +244,7 @@ def _on_release(session):
                 "-u", "critical",
                 "-i", "microphone-sensitivity-muted-symbolic",
                 "STT failed",
-                str(exc),
+                f"{duration_s:.0f}s clip — {type(exc).__name__}: {exc}",
             ],
             check=False,
         )
