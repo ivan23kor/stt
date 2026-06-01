@@ -321,6 +321,7 @@ dependencies = [
     { name = "httpx" },
     { name = "numpy" },
     { name = "pynput" },
+    { name = "python-xlib" },
     { name = "sounddevice" },
 ]
 
@@ -329,5 +330,6 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "pynput", specifier = ">=1.8.1" },
+    { name = "python-xlib", specifier = ">=0.33" },
     { name = "sounddevice", specifier = ">=0.5.5" },
 ]

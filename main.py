@@ -12,6 +12,7 @@ import wave
 import httpx
 import numpy as np
 import sounddevice as sd
+from Xlib import X, XK, display, error
 from pynput import keyboard
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
@@ -71,6 +72,80 @@ class RecordingSession:
         self._stream.close()
         with self._frames_lock:
             return list(self._frames)
+
+
+def _modifier_mask_for_keysym(dpy, keysym):
+    keycode = dpy.keysym_to_keycode(keysym)
+    if not keycode:
+        return 0
+
+    modifier_masks = (
+        X.ShiftMask,
+        X.LockMask,
+        X.ControlMask,
+        X.Mod1Mask,
+        X.Mod2Mask,
+        X.Mod3Mask,
+        X.Mod4Mask,
+        X.Mod5Mask,
+    )
+    for index, keycodes in enumerate(dpy.get_modifier_mapping()):
+        if keycode in keycodes:
+            return modifier_masks[index]
+    return 0
+
+
+def _modifier_combinations(masks):
+    combos = {0}
+    for mask in masks:
+        if mask:
+            combos.update(combo | mask for combo in tuple(combos))
+    return tuple(sorted(combos))
+
+
+class CtrlSpaceHotkey:
+    """Own Ctrl+Space with an X11 passive grab so focused apps never see it."""
+
+    def __init__(self, on_press, on_release):
+        self._on_press = on_press
+        self._on_release = on_release
+        self._pressed = False
+
+    def run(self):
+        dpy = display.Display()
+        root = dpy.screen().root
+        space_keycode = dpy.keysym_to_keycode(XK.string_to_keysym("space"))
+        ignored_modifiers = _modifier_combinations((
+            X.LockMask,
+            _modifier_mask_for_keysym(dpy, XK.XK_Num_Lock),
+            _modifier_mask_for_keysym(dpy, XK.XK_Scroll_Lock),
+        ))
+
+        try:
+            for ignored in ignored_modifiers:
+                root.grab_key(
+                    space_keycode,
+                    X.ControlMask | ignored,
+                    False,
+                    X.GrabModeAsync,
+                    X.GrabModeAsync,
+                )
+            dpy.sync()
+
+            while True:
+                event = dpy.next_event()
+                if event.type == X.KeyPress and not self._pressed:
+                    self._pressed = True
+                    self._on_press()
+                elif event.type == X.KeyRelease and self._pressed:
+                    self._pressed = False
+                    self._on_release()
+        except error.BadAccess as exc:
+            raise RuntimeError("Could not grab Ctrl+Space; another X11 client owns it") from exc
+        finally:
+            for ignored in ignored_modifiers:
+                root.ungrab_key(space_keycode, X.ControlMask | ignored)
+            dpy.close()
 
 
 def _frames_to_wav(frames):
@@ -395,8 +470,6 @@ def _on_release(session):
 def main():
     log.info("STT daemon ready — hold Ctrl+Space to dictate, Ctrl+Alt+S to speak selection")
 
-    ctrl_held = False
-    space_held = False
     current_session = [None]
     session_lock = threading.Lock()
     stop_timer = [None]
@@ -425,37 +498,22 @@ def main():
             stop_timer[0].cancel()
             stop_timer[0] = None
 
-    def on_press(key):
-        nonlocal ctrl_held, space_held
-        if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-            ctrl_held = True
-        elif key == keyboard.Key.space:
-            space_held = True
-        if ctrl_held and space_held:
-            _cancel_stop()
+    def on_ctrl_space_press():
+        _cancel_stop()
+        with session_lock:
+            if current_session[0] is not None:
+                return
+            session = RecordingSession()
+            current_session[0] = session
+        try:
+            session.start()
+        except Exception:
             with session_lock:
-                if current_session[0] is not None:
-                    return
-                session = RecordingSession()
-                current_session[0] = session
-            try:
-                session.start()
-            except Exception:
-                with session_lock:
-                    if current_session[0] is session:
-                        current_session[0] = None
-                session.stop_and_capture()
-                raise
-            log.info("Recording...")
-
-    def on_release(key):
-        nonlocal ctrl_held, space_held
-        if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-            ctrl_held = False
-        elif key == keyboard.Key.space:
-            space_held = False
-        if not (ctrl_held and space_held):
-            _schedule_stop()
+                if current_session[0] is session:
+                    current_session[0] = None
+            session.stop_and_capture()
+            raise
+        log.info("Recording...")
 
     hotkeys = keyboard.GlobalHotKeys({
         "<ctrl>+<alt>+s": lambda: threading.Thread(
@@ -470,8 +528,7 @@ def main():
     })
     hotkeys.start()
 
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-        listener.join()
+    CtrlSpaceHotkey(on_ctrl_space_press, _schedule_stop).run()
 
 
 if __name__ == "__main__":

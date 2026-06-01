@@ -8,5 +8,6 @@ dependencies = [
     "httpx>=0.28.1",
     "numpy>=2.4.4",
     "pynput>=1.8.1",
+    "python-xlib>=0.33",
     "sounddevice>=0.5.5",
 ]
