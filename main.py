@@ -39,8 +39,9 @@ ETA_PER_SEC      = float(os.environ.get("STT_ETA_PER_SEC", "0.3")) # decode seco
 CAL_PATH         = os.path.expanduser("~/.cache/stt/latency-cal.json")
 
 INCREMENTAL_ENABLED = os.environ.get("STT_INCREMENTAL", "1") != "0"
-PARTIAL_INTERVAL_S  = float(os.environ.get("STT_PARTIAL_INTERVAL", "3.0"))  # wall-clock between partial passes
+PARTIAL_INTERVAL_S  = float(os.environ.get("STT_PARTIAL_INTERVAL", "1.5"))  # wall-clock between partial passes
 PARTIAL_MIN_AUDIO_S = float(os.environ.get("STT_PARTIAL_MIN_AUDIO", "1.0")) # skip passes with less audio than this
+HOLDBACK_WORDS      = int(os.environ.get("STT_HOLDBACK_WORDS", "2"))        # trailing words held uncommitted (Whisper's unstable tail)
 
 PIPER_BIN = os.path.expanduser("~/.local/bin/piper")
 PIPER_MODEL = os.environ.get(
@@ -324,18 +325,8 @@ def _render_dots(frac):
 
 
 def _tokenize(text):
-    """Split a transcription into whitespace word tokens for prefix comparison."""
+    """Split a transcription into whitespace word tokens."""
     return text.split()
-
-
-def _common_prefix_len(a, b):
-    """Number of leading list elements equal in both word lists."""
-    n = 0
-    for wa, wb in zip(a, b):
-        if wa != wb:
-            break
-        n += 1
-    return n
 
 
 def _load_cal():
@@ -454,20 +445,20 @@ class IncrementalTranscriber:
 
     Starts when recording starts. Every PARTIAL_INTERVAL_S it snapshots the
     audio accumulated so far (without stopping the stream), transcribes the
-    whole growing window, and commits the prefix that two consecutive passes
-    agree on (LocalAgreement-2) — typing only the newly-stable words at the
-    caret. Already-typed words are NEVER erased, so there are no BackSpace
-    storms to saturate X input. On release, one final full transcription types
-    whatever suffix remains.
+    whole growing window, and commits all words EXCEPT the trailing
+    HOLDBACK_WORDS — typing the newly-committed words at the caret. The held-back
+    tail is where Whisper re-segments and where a snapshot may have cut a word
+    mid-utterance, so it waits for the next pass (or the final pass). Already-typed
+    words are NEVER erased, so there are no BackSpace storms to saturate X input.
+    On release, one final full transcription types whatever suffix remains.
 
     Locking: every xdotool call goes through _type_words under _type_lock (the
-    inner lock); commit state (_prev_words/_committed) is guarded by _state_lock
-    (the outer lock). Never reverse that order.
+    inner lock); commit state (_committed) is guarded by _state_lock (the outer
+    lock). Never reverse that order.
     """
 
     def __init__(self, session):
         self._session = session
-        self._prev_words = []   # last pass's word list (LocalAgreement baseline)
         self._committed = []    # words already typed on screen (source of truth)
         self._type_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -500,15 +491,12 @@ class IncrementalTranscriber:
         with self._state_lock:
             self._log_divergence(cur_words)
             already = len(self._committed)
-            if final:
-                stable_len = len(cur_words)
-            else:
-                stable_len = _common_prefix_len(self._prev_words, cur_words)
+            stable_len = len(cur_words) if final else max(already, len(cur_words) - HOLDBACK_WORDS)
             new_words = cur_words[already:stable_len]
             if new_words:
                 self._type_words(new_words)
                 self._committed.extend(new_words)
-            self._prev_words = cur_words
+                log.info("committed%s: %r", " (final)" if final else "", " ".join(new_words))
 
     def _log_divergence(self, cur_words):
         upto = min(len(self._committed), len(cur_words))
