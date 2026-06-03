@@ -38,6 +38,10 @@ ETA_BASE         = float(os.environ.get("STT_ETA_BASE", "0.6"))    # network/que
 ETA_PER_SEC      = float(os.environ.get("STT_ETA_PER_SEC", "0.3")) # decode seconds per audio second
 CAL_PATH         = os.path.expanduser("~/.cache/stt/latency-cal.json")
 
+INCREMENTAL_ENABLED = os.environ.get("STT_INCREMENTAL", "1") != "0"
+PARTIAL_INTERVAL_S  = float(os.environ.get("STT_PARTIAL_INTERVAL", "3.0"))  # wall-clock between partial passes
+PARTIAL_MIN_AUDIO_S = float(os.environ.get("STT_PARTIAL_MIN_AUDIO", "1.0")) # skip passes with less audio than this
+
 PIPER_BIN = os.path.expanduser("~/.local/bin/piper")
 PIPER_MODEL = os.environ.get(
     "STT_PIPER_MODEL",
@@ -319,6 +323,21 @@ def _render_dots(frac):
     return "." * min(5, 1 + int(max(0.0, min(1.0, frac)) / 0.2))
 
 
+def _tokenize(text):
+    """Split a transcription into whitespace word tokens for prefix comparison."""
+    return text.split()
+
+
+def _common_prefix_len(a, b):
+    """Number of leading list elements equal in both word lists."""
+    n = 0
+    for wa, wb in zip(a, b):
+        if wa != wb:
+            break
+        n += 1
+    return n
+
+
 def _load_cal():
     """Return the persisted ETA-calibration multiplier (default 1.0)."""
     try:
@@ -430,12 +449,125 @@ class CaretProgress:
                 subprocess.run(cmd, check=False)
 
 
+class IncrementalTranscriber:
+    """Live transcription: type recognized words as they stabilize, append-only.
+
+    Starts when recording starts. Every PARTIAL_INTERVAL_S it snapshots the
+    audio accumulated so far (without stopping the stream), transcribes the
+    whole growing window, and commits the prefix that two consecutive passes
+    agree on (LocalAgreement-2) — typing only the newly-stable words at the
+    caret. Already-typed words are NEVER erased, so there are no BackSpace
+    storms to saturate X input. On release, one final full transcription types
+    whatever suffix remains.
+
+    Locking: every xdotool call goes through _type_words under _type_lock (the
+    inner lock); commit state (_prev_words/_committed) is guarded by _state_lock
+    (the outer lock). Never reverse that order.
+    """
+
+    def __init__(self, session):
+        self._session = session
+        self._prev_words = []   # last pass's word list (LocalAgreement baseline)
+        self._committed = []    # words already typed on screen (source of truth)
+        self._type_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._worker = None
+
+    def start(self):
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+
+    def _run(self):
+        while not self._stop.wait(PARTIAL_INTERVAL_S):
+            try:
+                self._partial_pass()
+            except Exception as exc:
+                log.warning("partial pass failed (continuing): %s", exc)
+
+    def _snapshot_frames(self):
+        with self._session._frames_lock:
+            return list(self._session._frames)
+
+    def _partial_pass(self):
+        frames = self._snapshot_frames()
+        if len(frames) * 1024 / SAMPLE_RATE < PARTIAL_MIN_AUDIO_S:
+            return
+        text = _transcribe(_frames_to_wav(frames))
+        self._commit_step(_tokenize(text), final=False)
+
+    def _commit_step(self, cur_words, final):
+        with self._state_lock:
+            self._log_divergence(cur_words)
+            already = len(self._committed)
+            if final:
+                stable_len = len(cur_words)
+            else:
+                stable_len = _common_prefix_len(self._prev_words, cur_words)
+            new_words = cur_words[already:stable_len]
+            if new_words:
+                self._type_words(new_words)
+                self._committed.extend(new_words)
+            self._prev_words = cur_words
+
+    def _log_divergence(self, cur_words):
+        upto = min(len(self._committed), len(cur_words))
+        for i in range(upto):
+            if self._committed[i] != cur_words[i]:
+                log.warning(
+                    "divergence at word %d: typed=%r model_now=%r "
+                    "(append-only: leaving typed text as-is)",
+                    i, self._committed[i], cur_words[i],
+                )
+                break
+
+    def _type_words(self, words):
+        chunk = (" " if self._committed else "") + " ".join(words)
+        with self._type_lock:
+            _type_text(chunk)
+
+    def finish_and_flush(self, captured_frames):
+        """Stop the worker, transcribe the full clip, type the remaining suffix."""
+        self._stop.set()
+        if self._worker:
+            self._worker.join(timeout=PARTIAL_INTERVAL_S + 30)
+        text = _transcribe(_frames_to_wav(captured_frames))
+        self._commit_step(_tokenize(text), final=True)
+        return " ".join(self._committed)
+
+
 def _on_release(session):
     captured = session.stop_and_capture()
     duration_s = len(captured) * 1024 / SAMPLE_RATE  # approx
+    ctrl = getattr(session, "incremental", None)
     if duration_s < 0.3:
+        if ctrl:
+            ctrl._stop.set()
         log.info("Too short (%.1fs), ignored", duration_s)
         return
+
+    if ctrl is not None:
+        log.info("Finalizing %.1fs of audio (incremental)...", duration_s)
+        t0 = time.monotonic()
+        try:
+            final_text = ctrl.finish_and_flush(captured)
+            latency = time.monotonic() - t0
+            log.info("→ %r (%.1fs, incremental)", final_text, latency)
+            _update_calibration(duration_s, latency)
+        except Exception as exc:
+            log.error("Incremental transcription failed: %s", exc)
+            subprocess.run(
+                [
+                    "notify-send",
+                    "-u", "critical",
+                    "-i", "microphone-sensitivity-muted-symbolic",
+                    "STT failed",
+                    f"{duration_s:.0f}s clip — {type(exc).__name__}: {exc}",
+                ],
+                check=False,
+            )
+        return
+
     log.info("Transcribing %.1fs of audio...", duration_s)
     bar = CaretProgress(_estimate_eta(duration_s)) if PROGRESS_ENABLED else None
     if bar:
@@ -513,6 +645,9 @@ def main():
                     current_session[0] = None
             session.stop_and_capture()
             raise
+        if INCREMENTAL_ENABLED:
+            session.incremental = IncrementalTranscriber(session)
+            session.incremental.start()
         log.info("Recording...")
 
     hotkeys = keyboard.GlobalHotKeys({
