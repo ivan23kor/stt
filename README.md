@@ -43,6 +43,24 @@ export STT_PIPER_MODEL="$HOME/.local/share/piper/en_US-amy-medium.onnx"
 The microphone is opened only while `Ctrl+Space` is held, then closed before
 transcription starts.
 
+### WSLg / Windows global shortcut
+
+WSLg's X11 compatibility layer cannot see physical keyboard shortcuts from
+Windows Chrome or Windows Terminal. Install the Windows-side bridge once:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\windows\Install-STT-Hotkey-Bridge.ps1
+```
+
+The bridge registers `Ctrl+Alt+S`, `Ctrl+Alt+P`, and `Ctrl+Alt+X` with Windows,
+sends `Ctrl+C` to the focused application for speech requests, and streams the
+copied selection to `scripts/speak-stdin.sh` in WSL. Pause/resume and stop are
+handled by `scripts/control-playback.sh`. The bridge starts automatically from
+the current Windows user's Startup folder; its diagnostic log is
+`%LOCALAPPDATA%\IvanKorostelev\STT\hotkey-bridge.log`.
+While it works, a non-focus-stealing overlay in the lower-right corner shows
+copying, Groq summarization, estimated playback time, completion, and errors.
+
 ## Autostart
 
 Copy `stt-daemon.desktop` to `~/.config/autostart/stt-daemon.desktop` and make
