@@ -11,6 +11,7 @@ Linux desktop daemon for voice dictation and text-to-speech.
 
 Speech-to-text uses **Groq Whisper** (cloud, free tier).  
 Text-to-speech uses **Piper** (local, free, offline).  
+Piper speaks at `1.2×` speed by default.
 
 ## Requirements
 
@@ -35,6 +36,7 @@ GROQ_API_KEY=... uv run python main.py
 ```bash
 export STT_TRANSCRIPTION_PROMPT="Dictation for general desktop text entry."
 export STT_PIPER_MODEL="$HOME/.local/share/piper/en_US-amy-medium.onnx"
+export STT_PIPER_LENGTH_SCALE="0.833333"         # 1 / speed; default is 20% faster
 ```
 
 The microphone is opened only while `Ctrl+Space` is held, then closed before

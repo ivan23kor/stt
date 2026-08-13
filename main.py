@@ -38,6 +38,8 @@ PIPER_MODEL = os.environ.get(
     "STT_PIPER_MODEL",
     os.path.expanduser("~/.local/share/piper/en_US-amy-medium.onnx"),
 )
+# Piper's length scale is inverse to speaking speed: 1 / 1.2 is 20% faster.
+PIPER_LENGTH_SCALE = float(os.environ.get("STT_PIPER_LENGTH_SCALE", str(1 / 1.2)))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -229,7 +231,12 @@ def _speak(text):
 
     try:
         piper = subprocess.Popen(
-            [PIPER_BIN, "--model", PIPER_MODEL, "--output_raw"],
+            [
+                PIPER_BIN,
+                "--model", PIPER_MODEL,
+                "--length-scale", str(PIPER_LENGTH_SCALE),
+                "--output_raw",
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
