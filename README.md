@@ -5,13 +5,12 @@ Linux desktop daemon for voice dictation and text-to-speech.
 | Shortcut | Action |
 |---|---|
 | Hold `Ctrl+Space` | Record speech → transcribe → type into focused window |
-| `Ctrl+Alt+S` | Summarize selected text with Groq → speak gist aloud (Piper, local) |
+| `Ctrl+Alt+S` | Read selected text verbatim (Piper, local) |
 | `Ctrl+Alt+X` | Stop TTS playback |
 | `Ctrl+Alt+P` | Pause / resume TTS playback |
 
 Speech-to-text uses **Groq Whisper** (cloud, free tier).  
 Text-to-speech uses **Piper** (local, free, offline).  
-The summary step uses **Groq chat** (cloud, free tier, `openai/gpt-oss-20b`).
 
 ## Requirements
 
@@ -35,8 +34,6 @@ GROQ_API_KEY=... uv run python main.py
 
 ```bash
 export STT_TRANSCRIPTION_PROMPT="Dictation for general desktop text entry."
-export STT_SUMMARY_MODEL="openai/gpt-oss-20b"   # Groq chat model for summarisation
-export STT_SUMMARY_PROMPT="..."                  # Override the summarisation system prompt
 export STT_PIPER_MODEL="$HOME/.local/share/piper/en_US-amy-medium.onnx"
 ```
 
@@ -59,7 +56,7 @@ handled by `scripts/control-playback.sh`. The bridge starts automatically from
 the current Windows user's Startup folder; its diagnostic log is
 `%LOCALAPPDATA%\IvanKorostelev\STT\hotkey-bridge.log`.
 While it works, a non-focus-stealing overlay in the lower-right corner shows
-copying, Groq summarization, estimated playback time, completion, and errors.
+copying, audio preparation, estimated playback time, completion, and errors.
 
 ## Autostart
 
