@@ -2,6 +2,6 @@
 Type=Application
 Name=STT Dictation
 Comment=Hold Ctrl+Space to dictate into the focused window
-Exec=bash -c 'cd /opt/stt && DISPLAY=:0 /opt/stt/.venv/bin/python main.py >> /tmp/stt-daemon.log 2>&1'
+Exec=bash -c 'set -a; . "/home/aivan/.personal/Locutor/.env"; set +a; cd "/home/aivan/.personal/stt" && DISPLAY=:0 "/home/aivan/.personal/stt/.venv/bin/python" main.py >> /tmp/stt-daemon.log 2>&1'
 Terminal=false
 X-GNOME-Autostart-enabled=true

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -15,7 +16,7 @@ import sounddevice as sd
 from Xlib import X, XK, display, error
 from pynput import keyboard
 
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 SAMPLE_RATE = 16000
@@ -162,6 +163,8 @@ def _frames_to_wav(frames):
 
 
 def _transcribe(wav_bytes):
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not set")
     with httpx.Client(
         timeout=httpx.Timeout(connect=10.0, write=120.0, read=60.0, pool=5.0)
     ) as client:
@@ -192,7 +195,7 @@ def _type_text(text):
 
 def _get_selection():
     """Return the current X primary selection, falling back to clipboard."""
-    for sel in ("primary", "clipboard"):
+    for sel in ("primary",):
         result = subprocess.run(
             ["xclip", "-o", "-selection", sel],
             capture_output=True,
@@ -200,11 +203,32 @@ def _get_selection():
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
+
+    # Some Wayland/XWayland and toolkit applications do not publish the
+    # highlighted text as PRIMARY until it is explicitly copied.
+    before = subprocess.run(
+        ["xclip", "-o", "-selection", "clipboard"],
+        capture_output=True,
+        text=True,
+    )
+    before_text = before.stdout.strip() if before.returncode == 0 else ""
+    subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+c"], check=False)
+    time.sleep(0.15)
+    result = subprocess.run(
+        ["xclip", "-o", "-selection", "clipboard"],
+        capture_output=True,
+        text=True,
+    )
+    copied = result.stdout.strip() if result.returncode == 0 else ""
+    if copied and copied != before_text:
+        return copied
     return ""
 
 
 def _summarize(text):
     """Send text to Groq and return a short spoken-friendly gist."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not set")
     with httpx.Client(
         timeout=httpx.Timeout(connect=10.0, write=120.0, read=60.0, pool=5.0)
     ) as client:
@@ -289,15 +313,20 @@ def _speak_selection():
     """Grab selection, summarize with Groq, speak with Piper."""
     text = _get_selection()
     if not text:
+        log.warning("No selected text found")
         subprocess.run(
             ["notify-send", "-u", "normal", "-i", "audio-volume-high",
              "Speak", "No text selected"],
             check=False,
         )
         return
-    log.info("Summarizing %d chars...", len(text))
     try:
-        gist = _summarize(text)
+        if GROQ_API_KEY:
+            log.info("Summarizing %d chars...", len(text))
+            gist = _summarize(text)
+        else:
+            log.warning("GROQ_API_KEY is not set; speaking the selected text directly")
+            gist = text
         log.info("→ gist: %r", gist)
         _speak(gist)
     except Exception as exc:
@@ -307,6 +336,41 @@ def _speak_selection():
              "Speak failed", str(exc)],
             check=False,
         )
+
+
+def speak_stdin():
+    """Summarize text supplied by the Windows hotkey bridge and speak it."""
+    text = sys.stdin.read().strip()
+    if not text:
+        log.warning("Windows hotkey bridge supplied no selected text")
+        print("STT_STATUS\terror\tNo selected text was received", file=sys.stderr, flush=True)
+        return 1
+    try:
+        if GROQ_API_KEY:
+            print(
+                f"STT_STATUS\tsummarizing\tSummarizing {len(text)} selected characters",
+                file=sys.stderr,
+                flush=True,
+            )
+            log.info("Summarizing %d chars from Windows selection...", len(text))
+            gist = _summarize(text)
+        else:
+            log.warning("GROQ_API_KEY is not set; speaking the selected text directly")
+            gist = text
+        estimated_seconds = max(3, round(len(gist.split()) / 2.4))
+        print(
+            f"STT_STATUS\tspeaking\tPlaying the summary (about {estimated_seconds} seconds)",
+            file=sys.stderr,
+            flush=True,
+        )
+        log.info("Speaking Windows selection summary: %r", gist)
+        _speak(gist)
+        print("STT_STATUS\tdone\tFinished", file=sys.stderr, flush=True)
+        return 0
+    except Exception as exc:
+        log.exception("Windows selection speech failed")
+        print(f"STT_STATUS\terror\t{exc}", file=sys.stderr, flush=True)
+        return 1
 
 
 def _render_dots(frac):
@@ -515,21 +579,26 @@ def main():
             raise
         log.info("Recording...")
 
-    hotkeys = keyboard.GlobalHotKeys({
-        "<ctrl>+<alt>+s": lambda: threading.Thread(
-            target=_speak_selection, daemon=True
-        ).start(),
-        "<ctrl>+<alt>+x": lambda: threading.Thread(
-            target=_stop_speech, daemon=True
-        ).start(),
-        "<ctrl>+<alt>+p": lambda: threading.Thread(
-            target=_toggle_pause, daemon=True
-        ).start(),
-    })
-    hotkeys.start()
+    if os.environ.get("WSL_INTEROP"):
+        log.info("WSL detected — Windows bridge owns Ctrl+Alt+S/X/P")
+    else:
+        hotkeys = keyboard.GlobalHotKeys({
+            "<ctrl>+<alt>+s": lambda: threading.Thread(
+                target=_speak_selection, daemon=True
+            ).start(),
+            "<ctrl>+<alt>+x": lambda: threading.Thread(
+                target=_stop_speech, daemon=True
+            ).start(),
+            "<ctrl>+<alt>+p": lambda: threading.Thread(
+                target=_toggle_pause, daemon=True
+            ).start(),
+        })
+        hotkeys.start()
 
     CtrlSpaceHotkey(on_ctrl_space_press, _schedule_stop).run()
 
 
 if __name__ == "__main__":
+    if "--speak-stdin" in sys.argv:
+        raise SystemExit(speak_stdin())
     main()
