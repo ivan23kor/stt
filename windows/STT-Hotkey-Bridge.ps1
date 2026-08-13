@@ -12,6 +12,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -296,7 +297,8 @@ public sealed class STTHotkeyOverlay : Form
             speechProcess.Start();
             speechProcess.BeginErrorReadLine();
             speechProcess.BeginOutputReadLine();
-            speechProcess.StandardInput.Write(selection);
+            string encodedSelection = Convert.ToBase64String(Encoding.UTF8.GetBytes(selection));
+            speechProcess.StandardInput.Write(encodedSelection);
             speechProcess.StandardInput.Close();
         }
         catch (Exception exception) {
@@ -357,7 +359,7 @@ public sealed class STTHotkeyOverlay : Form
             stopRequested = false;
             bool requestActive = speechProcess != null && !speechProcess.HasExited;
             if (requestActive) {
-                SetStatus("Not speaking yet", "The selection is still being summarized", Color.FromArgb(143, 103, 246), true);
+                SetStatus("Not speaking yet", "The audio is still being prepared", Color.FromArgb(143, 103, 246), true);
                 ShowOverlay();
             } else {
                 busy = false;
@@ -408,9 +410,7 @@ public sealed class STTHotkeyOverlay : Form
 
     private void ApplyBridgeStatus(string state, string detail)
     {
-        if (state == "summarizing") {
-            SetStatus("Summarizing with Groq", detail + " (usually 1–5 seconds)", Color.FromArgb(143, 103, 246), true);
-        } else if (state == "speaking") {
+        if (state == "speaking") {
             SetStatus("Speaking", detail, Color.FromArgb(42, 190, 125), true);
         } else if (state == "done") {
             if (stopRequested) {

@@ -14,7 +14,10 @@ $form.TopMost = $true
 $textBox = New-Object System.Windows.Forms.TextBox
 $textBox.Dock = 'Fill'
 $textBox.Multiline = $true
-$textBox.Text = 'The Windows global shortcut bridge is working with selected text.'
+$superscriptT = [char]::ConvertFromUtf32(0x1D40)
+$timesSign = [char] 0x00D7
+$curlyApostrophe = [char] 0x2019
+$textBox.Text = "Unicode bridge test: QK${superscriptT} ${timesSign} P, GPT-2${curlyApostrophe}s tensors, and nonnegative probabilities."
 $form.Controls.Add($textBox)
 
 $timer = New-Object System.Windows.Forms.Timer
@@ -28,7 +31,7 @@ $timer.Add_Tick({
 })
 
 $closeTimer = New-Object System.Windows.Forms.Timer
-$closeTimer.Interval = 1200
+$closeTimer.Interval = 5000
 $closeTimer.Add_Tick({
     $closeTimer.Stop()
     $form.Close()
