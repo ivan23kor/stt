@@ -10,6 +10,7 @@ $source = @'
 using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -53,11 +54,18 @@ public sealed class STTHotkeyOverlay : Form
     private readonly System.Windows.Forms.Timer modifierTimer;
     private readonly System.Windows.Forms.Timer clipboardTimer;
     private readonly System.Windows.Forms.Timer hideTimer;
+    private readonly System.Windows.Forms.Timer progressTimer;
+    private readonly Stopwatch requestStopwatch = new Stopwatch();
+    private readonly Stopwatch playbackStopwatch = new Stopwatch();
     private int modifierAttempts;
     private int clipboardAttempts;
     private uint clipboardSequence;
     private bool busy;
     private bool stopRequested;
+    private bool playbackStarted;
+    private double estimatedSpeechSeconds = 5.0;
+    private double preparationSeconds;
+    private double playbackSeconds;
     private Process speechProcess;
 
     public STTHotkeyOverlay()
@@ -105,8 +113,11 @@ public sealed class STTHotkeyOverlay : Form
         progress = new ProgressBar();
         progress.Location = new Point(27, 79);
         progress.Size = new Size(342, 7);
-        progress.Style = ProgressBarStyle.Marquee;
-        progress.MarqueeAnimationSpeed = 24;
+        progress.Minimum = 0;
+        progress.Maximum = 1000;
+        progress.Value = 0;
+        progress.Style = ProgressBarStyle.Continuous;
+        progress.MarqueeAnimationSpeed = 0;
         Controls.Add(progress);
 
         modifierTimer = new System.Windows.Forms.Timer();
@@ -123,6 +134,10 @@ public sealed class STTHotkeyOverlay : Form
             hideTimer.Stop();
             Hide();
         };
+
+        progressTimer = new System.Windows.Forms.Timer();
+        progressTimer.Interval = 100;
+        progressTimer.Tick += ProgressTimerTick;
 
         Shown += delegate {
             PositionOverlay();
@@ -211,11 +226,62 @@ public sealed class STTHotkeyOverlay : Form
 
         busy = true;
         stopRequested = false;
+        StartRequestProgress();
         hideTimer.Stop();
         SetStatus("Copying selected text", "Usually less than one second", Color.FromArgb(74, 144, 245), true);
         ShowOverlay();
         modifierAttempts = 0;
         modifierTimer.Start();
+    }
+
+    private void StartRequestProgress()
+    {
+        requestStopwatch.Restart();
+        playbackStopwatch.Reset();
+        playbackStarted = false;
+        estimatedSpeechSeconds = 5.0;
+        preparationSeconds = 0.0;
+        playbackSeconds = 0.0;
+        progress.Value = 0;
+        progressTimer.Start();
+    }
+
+    private void ProgressTimerTick(object sender, EventArgs args)
+    {
+        if (!busy) return;
+
+        if (!playbackStarted) {
+            double elapsed = requestStopwatch.Elapsed.TotalSeconds;
+            double estimatedTotal = Math.Max(elapsed + 0.5, 1.5 + estimatedSpeechSeconds);
+            SetProgressFraction(Math.Min(0.35, elapsed / estimatedTotal));
+            if (titleLabel.Text != "Copying selected text") {
+                detailLabel.Text = String.Format("Preparing audio - {0:0.0}s elapsed", elapsed);
+            }
+            return;
+        }
+
+        double played = Math.Min(playbackSeconds, playbackStopwatch.Elapsed.TotalSeconds);
+        double total = Math.Max(0.1, preparationSeconds + playbackSeconds);
+        SetProgressFraction((preparationSeconds + played) / total);
+        double remaining = Math.Max(0.0, playbackSeconds - played);
+        detailLabel.Text = String.Format(
+            "Reading selected text - {0} second{1} remaining",
+            Math.Ceiling(remaining),
+            Math.Ceiling(remaining) == 1 ? "" : "s");
+    }
+
+    private void SetProgressFraction(double fraction)
+    {
+        int target = Math.Max(0, Math.Min(progress.Maximum, (int)Math.Round(fraction * progress.Maximum)));
+        progress.Value = Math.Max(progress.Value, target);
+    }
+
+    private void StopProgress(bool completed)
+    {
+        progressTimer.Stop();
+        requestStopwatch.Stop();
+        playbackStopwatch.Stop();
+        if (completed) progress.Value = progress.Maximum;
     }
 
     private void ModifierTimerTick(object sender, EventArgs args)
@@ -271,9 +337,13 @@ public sealed class STTHotkeyOverlay : Form
 
     private void StartSpeech(string selection)
     {
+        int wordCount = selection.Split(
+            new char[] { ' ', '\t', '\r', '\n' },
+            StringSplitOptions.RemoveEmptyEntries).Length;
+        estimatedSpeechSeconds = Math.Max(3.0, wordCount / (2.4 * 1.2));
         SetStatus(
-            "Starting STT",
-            String.Format("Sending {0:N0} selected characters to WSL...", selection.Length),
+            "Preparing audio",
+            String.Format("Sending {0:N0} selected characters to Piper...", selection.Length),
             Color.FromArgb(74, 144, 245),
             true);
         Log(String.Format("SENT {0} selected characters to WSL.", selection.Length));
@@ -346,13 +416,23 @@ public sealed class STTHotkeyOverlay : Form
     private void ApplyPlaybackControl(string result)
     {
         if (result == "paused") {
-            SetStatus("Paused", "Ctrl+Alt+P resumes; Ctrl+Alt+X stops", Color.FromArgb(245, 166, 35), false);
+            playbackStopwatch.Stop();
+            progressTimer.Stop();
+            double remaining = Math.Max(0.0, playbackSeconds - playbackStopwatch.Elapsed.TotalSeconds);
+            SetStatus(
+                "Paused",
+                String.Format("{0}s remaining; Ctrl+Alt+P resumes", Math.Ceiling(remaining)),
+                Color.FromArgb(245, 166, 35),
+                false);
             ShowOverlay();
         } else if (result == "resumed") {
+            if (playbackStarted) playbackStopwatch.Start();
+            progressTimer.Start();
             SetStatus("Speaking", "Playback resumed", Color.FromArgb(42, 190, 125), true);
             ShowOverlay();
         } else if (result == "stopped") {
             busy = false;
+            StopProgress(false);
             SetStatus("Stopped", "Playback ended", Color.FromArgb(230, 79, 79), false);
             ShowFor(2200);
         } else {
@@ -363,6 +443,8 @@ public sealed class STTHotkeyOverlay : Form
                 ShowOverlay();
             } else {
                 busy = false;
+                StopProgress(false);
+                progress.Value = 0;
                 SetStatus("Nothing is playing", "Start speech with Ctrl+Alt+S", Color.FromArgb(245, 166, 35), false);
                 ShowFor(2500);
             }
@@ -395,6 +477,7 @@ public sealed class STTHotkeyOverlay : Form
             if (busy) {
                 if (stopRequested) {
                     busy = false;
+                    StopProgress(false);
                     SetStatus("Stopped", "Playback ended", Color.FromArgb(230, 79, 79), false);
                     ShowFor(2200);
                 } else if (exitCode == 0) {
@@ -410,11 +493,44 @@ public sealed class STTHotkeyOverlay : Form
 
     private void ApplyBridgeStatus(string state, string detail)
     {
-        if (state == "speaking") {
-            SetStatus("Speaking", detail, Color.FromArgb(42, 190, 125), true);
+        if (stopRequested) return;
+
+        double seconds;
+        if (state == "preparing") {
+            if (Double.TryParse(detail, NumberStyles.Float, CultureInfo.InvariantCulture, out seconds)) {
+                estimatedSpeechSeconds = Math.Max(0.1, seconds);
+            }
+            SetStatus(
+                "Preparing audio",
+                String.Format("Waiting for Piper - {0:0.0}s elapsed", requestStopwatch.Elapsed.TotalSeconds),
+                Color.FromArgb(143, 103, 246),
+                true);
+        } else if (state == "speaking") {
+            if (!Double.TryParse(detail, NumberStyles.Float, CultureInfo.InvariantCulture, out seconds)) {
+                Fail("STT failed", "Invalid playback duration received from WSL");
+                return;
+            }
+            requestStopwatch.Stop();
+            preparationSeconds = requestStopwatch.Elapsed.TotalSeconds;
+            playbackSeconds = Math.Max(0.1, seconds);
+            playbackStarted = true;
+            playbackStopwatch.Restart();
+            progressTimer.Start();
+            Log(String.Format(
+                CultureInfo.InvariantCulture,
+                "PLAYBACK started after {0:0.000}s preparation; audio is {1:0.000}s.",
+                preparationSeconds,
+                playbackSeconds));
+            SetStatus(
+                "Speaking",
+                String.Format("Reading selected text - {0}s remaining", Math.Ceiling(playbackSeconds)),
+                Color.FromArgb(42, 190, 125),
+                true);
+            ProgressTimerTick(null, EventArgs.Empty);
         } else if (state == "done") {
             if (stopRequested) {
                 busy = false;
+                StopProgress(false);
                 SetStatus("Stopped", "Playback ended", Color.FromArgb(230, 79, 79), false);
                 ShowFor(2200);
             } else {
@@ -428,6 +544,7 @@ public sealed class STTHotkeyOverlay : Form
     private void Complete(string title, string detail)
     {
         busy = false;
+        StopProgress(true);
         SetStatus(title, detail, Color.FromArgb(42, 190, 125), false);
         ShowFor(1800);
     }
@@ -435,6 +552,7 @@ public sealed class STTHotkeyOverlay : Form
     private void Fail(string title, string detail)
     {
         busy = false;
+        StopProgress(false);
         Log("ERROR " + title + ": " + detail);
         SetStatus(title, detail, Color.FromArgb(230, 79, 79), false);
         System.Media.SystemSounds.Exclamation.Play();
@@ -446,9 +564,8 @@ public sealed class STTHotkeyOverlay : Form
         titleLabel.Text = title;
         detailLabel.Text = detail;
         accent.BackColor = color;
-        progress.Style = working ? ProgressBarStyle.Marquee : ProgressBarStyle.Continuous;
-        progress.MarqueeAnimationSpeed = working ? 24 : 0;
-        progress.Value = working ? 0 : 100;
+        progress.Style = ProgressBarStyle.Continuous;
+        progress.MarqueeAnimationSpeed = 0;
     }
 
     private void PositionOverlay()

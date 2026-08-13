@@ -221,7 +221,7 @@ def _get_selection():
     return ""
 
 
-def _speak(text):
+def _speak(text, on_playback_started=None):
     """Synthesize text with local Piper TTS and play via mpv."""
     # Kill any in-progress TTS playback first.
     subprocess.run(["pkill", "-f", "mpv.*tts-audio"], capture_output=True)
@@ -255,11 +255,19 @@ def _speak(text):
         piper.wait()
         ffmpeg.wait()
 
+        if piper.returncode != 0 or ffmpeg.returncode != 0:
+            raise RuntimeError("Piper audio synthesis failed")
+
+        with wave.open(tmp_path, "rb") as audio:
+            playback_seconds = audio.getnframes() / audio.getframerate()
+
         proc = subprocess.Popen(
             ["mpv", "--no-video", "--no-osd-bar", "--title=tts-audio", tmp_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        if on_playback_started:
+            on_playback_started(playback_seconds)
         proc.wait()
     finally:
         try:
@@ -318,14 +326,22 @@ def speak_stdin():
         print("STT_STATUS\terror\tNo selected text was received", file=sys.stderr, flush=True)
         return 1
     try:
-        estimated_seconds = max(3, round(len(text.split()) / 2.4))
+        estimated_seconds = max(3, len(text.split()) / (2.4 * 1.2))
         print(
-            f"STT_STATUS\tspeaking\tReading selected text (about {estimated_seconds} seconds)",
+            f"STT_STATUS\tpreparing\t{estimated_seconds:.3f}",
             file=sys.stderr,
             flush=True,
         )
+
+        def playback_started(playback_seconds):
+            print(
+                f"STT_STATUS\tspeaking\t{playback_seconds:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         log.info("Speaking Windows selection verbatim: %r", text)
-        _speak(text)
+        _speak(text, on_playback_started=playback_started)
         print("STT_STATUS\tdone\tFinished", file=sys.stderr, flush=True)
         return 0
     except Exception as exc:

@@ -58,7 +58,8 @@ handled by `scripts/control-playback.sh`. The bridge starts automatically from
 the current Windows user's Startup folder; its diagnostic log is
 `%LOCALAPPDATA%\IvanKorostelev\STT\hotkey-bridge.log`.
 While it works, a non-focus-stealing overlay in the lower-right corner shows
-copying, audio preparation, estimated playback time, completion, and errors.
+copying, measured audio-preparation time, a determinate playback progress bar,
+the remaining speech time, completion, and errors.
 
 ## Autostart
 
