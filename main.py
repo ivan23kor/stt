@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import io
 import json
 import logging
@@ -18,18 +19,11 @@ from pynput import keyboard
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 TRANSCRIPTION_PROMPT = os.environ.get(
     "STT_TRANSCRIPTION_PROMPT",
     "Dictation for general desktop text entry.",
-)
-SUMMARY_MODEL = os.environ.get("STT_SUMMARY_MODEL", "openai/gpt-oss-20b")
-SUMMARY_PROMPT = os.environ.get(
-    "STT_SUMMARY_PROMPT",
-    "You summarize text to be read aloud. Reply with a short spoken-friendly gist "
-    "(2-4 sentences), plain prose only — no markdown, lists, or headings.",
 )
 PROGRESS_ENABLED = os.environ.get("STT_PROGRESS", "1") != "0"
 PROGRESS_TICK_S  = 0.2   # redraw cadence (seconds)
@@ -225,29 +219,6 @@ def _get_selection():
     return ""
 
 
-def _summarize(text):
-    """Send text to Groq and return a short spoken-friendly gist."""
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not set")
-    with httpx.Client(
-        timeout=httpx.Timeout(connect=10.0, write=120.0, read=60.0, pool=5.0)
-    ) as client:
-        resp = client.post(
-            GROQ_CHAT_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={
-                "model": SUMMARY_MODEL,
-                "temperature": 0.2,
-                "messages": [
-                    {"role": "system", "content": SUMMARY_PROMPT},
-                    {"role": "user", "content": text},
-                ],
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-
-
 def _speak(text):
     """Synthesize text with local Piper TTS and play via mpv."""
     # Kill any in-progress TTS playback first.
@@ -310,7 +281,7 @@ def _toggle_pause():
 
 
 def _speak_selection():
-    """Grab selection, summarize with Groq, speak with Piper."""
+    """Grab the selection and speak it verbatim with Piper."""
     text = _get_selection()
     if not text:
         log.warning("No selected text found")
@@ -321,14 +292,8 @@ def _speak_selection():
         )
         return
     try:
-        if GROQ_API_KEY:
-            log.info("Summarizing %d chars...", len(text))
-            gist = _summarize(text)
-        else:
-            log.warning("GROQ_API_KEY is not set; speaking the selected text directly")
-            gist = text
-        log.info("→ gist: %r", gist)
-        _speak(gist)
+        log.info("Speaking selected text verbatim: %r", text)
+        _speak(text)
     except Exception as exc:
         log.error("Speak-selection failed: %s", exc)
         subprocess.run(
@@ -339,32 +304,21 @@ def _speak_selection():
 
 
 def speak_stdin():
-    """Summarize text supplied by the Windows hotkey bridge and speak it."""
-    text = sys.stdin.read().strip()
-    if not text:
+    """Decode and speak the Windows bridge's lossless UTF-8 payload."""
+    text = base64.b64decode(sys.stdin.buffer.read(), validate=True).decode("utf-8")
+    if not text.strip():
         log.warning("Windows hotkey bridge supplied no selected text")
         print("STT_STATUS\terror\tNo selected text was received", file=sys.stderr, flush=True)
         return 1
     try:
-        if GROQ_API_KEY:
-            print(
-                f"STT_STATUS\tsummarizing\tSummarizing {len(text)} selected characters",
-                file=sys.stderr,
-                flush=True,
-            )
-            log.info("Summarizing %d chars from Windows selection...", len(text))
-            gist = _summarize(text)
-        else:
-            log.warning("GROQ_API_KEY is not set; speaking the selected text directly")
-            gist = text
-        estimated_seconds = max(3, round(len(gist.split()) / 2.4))
+        estimated_seconds = max(3, round(len(text.split()) / 2.4))
         print(
-            f"STT_STATUS\tspeaking\tPlaying the summary (about {estimated_seconds} seconds)",
+            f"STT_STATUS\tspeaking\tReading selected text (about {estimated_seconds} seconds)",
             file=sys.stderr,
             flush=True,
         )
-        log.info("Speaking Windows selection summary: %r", gist)
-        _speak(gist)
+        log.info("Speaking Windows selection verbatim: %r", text)
+        _speak(text)
         print("STT_STATUS\tdone\tFinished", file=sys.stderr, flush=True)
         return 0
     except Exception as exc:
