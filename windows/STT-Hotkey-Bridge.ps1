@@ -18,13 +18,17 @@ using System.Windows.Forms;
 public sealed class STTHotkeyOverlay : Form
 {
     private const int WM_HOTKEY = 0x0312;
-    private const int HOTKEY_ID = 0x5354;
+    private const int HOTKEY_S_ID = 0x5354;
+    private const int HOTKEY_P_ID = 0x5054;
+    private const int HOTKEY_X_ID = 0x5854;
     private const uint MOD_ALT = 0x0001;
     private const uint MOD_CONTROL = 0x0002;
     private const uint MOD_NOREPEAT = 0x4000;
     private const int VK_CONTROL = 0x11;
     private const int VK_MENU = 0x12;
     private const int VK_S = 0x53;
+    private const int VK_P = 0x50;
+    private const int VK_X = 0x58;
     private const int WS_EX_TOOLWINDOW = 0x00000080;
     private const int WS_EX_NOACTIVATE = 0x08000000;
 
@@ -52,6 +56,7 @@ public sealed class STTHotkeyOverlay : Form
     private int clipboardAttempts;
     private uint clipboardSequence;
     private bool busy;
+    private bool stopRequested;
     private Process speechProcess;
 
     public STTHotkeyOverlay()
@@ -145,25 +150,51 @@ public sealed class STTHotkeyOverlay : Form
     protected override void OnHandleCreated(EventArgs args)
     {
         base.OnHandleCreated(args);
-        if (!RegisterHotKey(Handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_S)) {
+        uint modifiers = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
+        if (!RegisterHotKey(Handle, HOTKEY_S_ID, modifiers, VK_S)) {
             int error = Marshal.GetLastWin32Error();
             Log("ERROR Could not register Ctrl+Alt+S (Win32 " + error + ").");
             throw new InvalidOperationException("Could not register Ctrl+Alt+S (Win32 " + error + ").");
         }
-        Log("READY Ctrl+Alt+S registered globally with persistent overlay host.");
+        if (!RegisterHotKey(Handle, HOTKEY_P_ID, modifiers, VK_P)) {
+            int error = Marshal.GetLastWin32Error();
+            UnregisterHotKey(Handle, HOTKEY_S_ID);
+            Log("ERROR Could not register Ctrl+Alt+P (Win32 " + error + ").");
+            throw new InvalidOperationException("Could not register Ctrl+Alt+P (Win32 " + error + ").");
+        }
+        if (!RegisterHotKey(Handle, HOTKEY_X_ID, modifiers, VK_X)) {
+            int error = Marshal.GetLastWin32Error();
+            UnregisterHotKey(Handle, HOTKEY_S_ID);
+            UnregisterHotKey(Handle, HOTKEY_P_ID);
+            Log("ERROR Could not register Ctrl+Alt+X (Win32 " + error + ").");
+            throw new InvalidOperationException("Could not register Ctrl+Alt+X (Win32 " + error + ").");
+        }
+        Log("READY Ctrl+Alt+S/P/X registered globally with persistent overlay host.");
     }
 
     protected override void OnHandleDestroyed(EventArgs args)
     {
-        UnregisterHotKey(Handle, HOTKEY_ID);
+        UnregisterHotKey(Handle, HOTKEY_S_ID);
+        UnregisterHotKey(Handle, HOTKEY_P_ID);
+        UnregisterHotKey(Handle, HOTKEY_X_ID);
         Log("STOP Overlay host handle destroyed.");
         base.OnHandleDestroyed(args);
     }
 
     protected override void WndProc(ref Message message)
     {
-        if (message.Msg == WM_HOTKEY && message.WParam.ToInt32() == HOTKEY_ID) {
-            BeginSelectionCopy();
+        if (message.Msg == WM_HOTKEY) {
+            int hotkey = message.WParam.ToInt32();
+            if (hotkey == HOTKEY_S_ID) {
+                BeginSelectionCopy();
+            } else if (hotkey == HOTKEY_P_ID) {
+                Log("HOTKEY Ctrl+Alt+P received.");
+                RunPlaybackControl("toggle");
+            } else if (hotkey == HOTKEY_X_ID) {
+                Log("HOTKEY Ctrl+Alt+X received.");
+                stopRequested = true;
+                RunPlaybackControl("stop");
+            }
         }
         base.WndProc(ref message);
     }
@@ -178,6 +209,7 @@ public sealed class STTHotkeyOverlay : Form
         }
 
         busy = true;
+        stopRequested = false;
         hideTimer.Stop();
         SetStatus("Copying selected text", "Usually less than one second", Color.FromArgb(74, 144, 245), true);
         ShowOverlay();
@@ -272,6 +304,69 @@ public sealed class STTHotkeyOverlay : Form
         }
     }
 
+    private void RunPlaybackControl(string action)
+    {
+        hideTimer.Stop();
+        string title = action == "stop" ? "Stopping playback" : "Changing playback";
+        SetStatus(title, "Sending the command to WSL...", Color.FromArgb(245, 166, 35), true);
+        ShowOverlay();
+
+        ThreadPool.QueueUserWorkItem(delegate {
+            try {
+                ProcessStartInfo start = new ProcessStartInfo();
+                start.FileName = "wsl.exe";
+                start.Arguments = "-d Ubuntu -- /home/aivan/.personal/stt/scripts/control-playback.sh " + action;
+                start.UseShellExecute = false;
+                start.CreateNoWindow = true;
+                start.RedirectStandardOutput = true;
+                start.RedirectStandardError = true;
+
+                using (Process control = Process.Start(start)) {
+                    string output = control.StandardOutput.ReadToEnd().Trim();
+                    string error = control.StandardError.ReadToEnd().Trim();
+                    control.WaitForExit();
+                    Log("CONTROL " + action + " returned " + output + " (exit " + control.ExitCode + ").");
+                    if (control.ExitCode != 0) {
+                        string problem = String.IsNullOrWhiteSpace(error) ? "Playback control failed" : error;
+                        Ui(delegate { stopRequested = false; Fail("Playback control failed", problem); });
+                    } else {
+                        Ui(delegate { ApplyPlaybackControl(output); });
+                    }
+                }
+            }
+            catch (Exception exception) {
+                Log("ERROR Playback control: " + exception);
+                Ui(delegate { stopRequested = false; Fail("Playback control failed", exception.Message); });
+            }
+        });
+    }
+
+    private void ApplyPlaybackControl(string result)
+    {
+        if (result == "paused") {
+            SetStatus("Paused", "Ctrl+Alt+P resumes; Ctrl+Alt+X stops", Color.FromArgb(245, 166, 35), false);
+            ShowOverlay();
+        } else if (result == "resumed") {
+            SetStatus("Speaking", "Playback resumed", Color.FromArgb(42, 190, 125), true);
+            ShowOverlay();
+        } else if (result == "stopped") {
+            busy = false;
+            SetStatus("Stopped", "Playback ended", Color.FromArgb(230, 79, 79), false);
+            ShowFor(2200);
+        } else {
+            stopRequested = false;
+            bool requestActive = speechProcess != null && !speechProcess.HasExited;
+            if (requestActive) {
+                SetStatus("Not speaking yet", "The selection is still being summarized", Color.FromArgb(143, 103, 246), true);
+                ShowOverlay();
+            } else {
+                busy = false;
+                SetStatus("Nothing is playing", "Start speech with Ctrl+Alt+S", Color.FromArgb(245, 166, 35), false);
+                ShowFor(2500);
+            }
+        }
+    }
+
     private void SpeechErrorDataReceived(object sender, DataReceivedEventArgs args)
     {
         if (String.IsNullOrEmpty(args.Data)) return;
@@ -296,7 +391,11 @@ public sealed class STTHotkeyOverlay : Form
         Log("WSL process exited with code " + exitCode + ".");
         Ui(delegate {
             if (busy) {
-                if (exitCode == 0) {
+                if (stopRequested) {
+                    busy = false;
+                    SetStatus("Stopped", "Playback ended", Color.FromArgb(230, 79, 79), false);
+                    ShowFor(2200);
+                } else if (exitCode == 0) {
                     Complete("Finished", "Ready for another selection");
                 } else {
                     Fail("STT failed", "See hotkey-bridge.log for details");
@@ -314,7 +413,13 @@ public sealed class STTHotkeyOverlay : Form
         } else if (state == "speaking") {
             SetStatus("Speaking", detail, Color.FromArgb(42, 190, 125), true);
         } else if (state == "done") {
-            Complete("Finished", detail);
+            if (stopRequested) {
+                busy = false;
+                SetStatus("Stopped", "Playback ended", Color.FromArgb(230, 79, 79), false);
+                ShowFor(2200);
+            } else {
+                Complete("Finished", detail);
+            }
         } else if (state == "error") {
             Fail("STT failed", detail);
         }
